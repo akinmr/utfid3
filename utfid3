@@ -1,0 +1,335 @@
+#!/usr/bin/perl
+# vim: ts=2:sw=2:expandtab:cindent
+
+use 5;
+use strict;
+use Getopt::Long;
+use Encode;
+use Encode::Guess qw(utf8);
+
+use constant FALLBACK_CHRCODE => 'cp932';
+
+use constant ID3FLG_RMVBYBDYCHG =>  64;
+use constant ID3FLG_RMVBYTAGCHG => 128;
+
+my %tags;
+my @order = qw(TPOS TRCK TSRC TIT2 TPE1 TCON TALB TLEN GEOB);
+my %hdflag = (TLEN => [ID3FLG_RMVBYBDYCHG, 0]);
+my $codewarn = 0;
+
+sub help() {
+  print <<EOF;
+Usage: $0 [OPTIONS] mp3-file
+options:
+  -h --help    - show this message and exit
+  -c --create  - do not use old tag value
+  -e --encode  - choose non-ascii encoding (utf16le, utf16be, utf8)
+  -a --artist  - set artist
+  -g --genre   - set genre
+  -A --album   - set album title
+  -d --disc    - set disc no  (# or #/# style)
+  -n --track   - set track no (# or #/# style)
+  -t --title   - set track title
+  -l --length  - set length in ms
+  -i --isrc    - set ISRC code
+  -s --show    - show text tags
+  -x --export  - export GEOB files
+  -m --import  - import GEOB file
+  -D --datadir - specify dirctory for GEOB files (%a: album title)
+EOF
+  exit 0;
+}
+
+my $create;
+my $encode = 'utf16le';
+my $show;
+my $export;
+my $import;
+my $datadir;
+
+Getopt::Long::Configure('gnu_getopt'); 
+GetOptions('help|h' => \&help,
+  'create|c!'   => \$create,
+  'encode|e=s'  => \$encode,
+  'artist|a=s'  => \$tags{TPE1},
+  'genre|g=s'   => \$tags{TCON},
+  'album|A=s'   => \$tags{TALB},
+  'disc|d=s'    => \$tags{TPOS},
+  'track|n=s'   => \$tags{TRCK},
+  'title|t=s'   => \$tags{TIT2},
+  'length|l=s'  => \$tags{TLEN},
+  'isrc|i=s'    => \$tags{TSRC},
+  'show|s!'     => \$show,
+  'export|x!'   => \$export,
+  'import|m!'   => \$import,
+  'datadir|D=s' => \$datadir,
+) || help;
+
+help unless $ARGV[0];
+
+sub toencstr($) {
+  local $SIG{__WARN__} = sub {};
+  my $str = shift;
+  return undef unless $str;
+  if ($str =~ /[^[:print:]\0]/) {
+    my @str = split /\0/, $str;
+    if ($encode eq 'utf16le') {
+      Encode::from_to($_, 'guess', 'UTF-16-LE') foreach @str;
+      $str = chr(1) . "\xff\xfe" . join("\0\0", @str);
+    }
+    elsif ($encode eq 'utf16be') {
+      Encode::from_to($str, 'guess', 'UTF-16') foreach @str;
+      $str = chr(1) . join("\0\0", @str);
+    }
+    elsif ($encode eq 'utf8') {
+      Encode::from_to($str, 'guess', 'utf8') foreach @str;
+      $str = chr(3) . join("\0", @str);
+    }
+    else {
+      die 'No suitable encoding for non ascii';
+    }
+  }
+  else {
+    $str = chr(0) . $str;
+  }
+  return $str
+}
+
+sub fromencstr($) {
+  local $SIG{__WARN__} = sub {};
+  my $str = shift;
+  my $refstr = ref $str ? $str : \$str;
+  my $code = ord substr $$refstr, 0, 1, '';
+  my $terminator = $code == 1 ? '\0\0' : '\0';
+  my $encstr = $$refstr =~ s/^(.*?$terminator)// ? $1 : $$refstr;
+  Encode::from_to($encstr, 'utf16', 'utf8') if $code == 1;
+  if ($code == 0 && FALLBACK_CHRCODE && $encstr =~ /[^[:print:]\0]/) {
+    $codewarn = 1;
+    Encode::from_to($encstr, FALLBACK_CHRCODE, 'utf8');
+  }
+  $encstr =~ tr/\0//d;
+  return $encstr;
+}
+
+sub tosyncsafeint($) {
+  my $val = shift;
+  my $str = '';
+  for (0 .. 3) {
+    $str = chr($val % 128) . $str;
+    $val >>= 7;
+  }
+  return $str;
+}
+
+sub fromsyncsafeint($) {
+  my $str = shift;
+  my $val = 0;
+  $val = ($val << 7) + $_ foreach unpack 'cccc', $str;
+  return $val;
+}
+
+sub totagframe($@) {
+  my $tagname = shift;
+  my $tagvalue = shift;
+  my $hdflag = shift || [0, 0];
+  my $frame;
+  $frame .= $tagname;
+  $frame .= pack 'N', length $tagvalue;
+  $frame .= chr($hdflag->[0]) . chr($hdflag->[1]);
+  $frame .= $tagvalue;
+  return $frame;
+}
+
+sub getfiletag($) {
+  my $file = shift;
+
+  return 0 unless -r $file;
+  open FILE, '<', $file;
+  binmode FILE;
+  my $buf;
+  read FILE, $buf, 3;
+  if ($buf ne 'ID3') {
+    close FILE;
+    return 0 if $buf ne 'ID3';
+  }
+  seek FILE, 6, 0;
+  read FILE, $buf, 4;
+  my $tagsize = fromsyncsafeint $buf;
+  if ($create) {
+    close FILE;
+    return $tagsize;
+  }
+
+  my $tags = {};
+  read FILE, $buf, $tagsize;
+  close FILE;
+  while (ord(substr $buf, 0, 1)) {
+    my $tagname = substr $buf, 0, 4;
+    my $tagsize = unpack 'N', substr($buf, 4, 4);
+    my $tagflag = [unpack 'cc', substr $buf, 8, 2];
+    my $tagbody = substr $buf, 10, $tagsize;
+    substr $buf, 0, 10 + $tagsize, '';
+    push @{$tags->{$tagname}}, [$tagbody, $tagflag] unless ($tagflag->[0] & ID3FLG_RMVBYTAGCHG);
+  }
+  return $tagsize, $tags;
+}
+
+sub calctagsize($$$) {
+  my $tagbody = shift;
+  my $file = shift;
+  my $filetagsize = shift;
+  my $taglen = length $tagbody;
+  return $taglen unless -e $file;
+  return $filetagsize if $taglen + 10 <= $filetagsize;
+  $filetagsize = 2048 - (((-s $file) + 10) % 2048);
+  $filetagsize += 2048 while $taglen + 10 > $filetagsize;
+  return $filetagsize;
+}
+
+my $file = $ARGV[0];
+my ($filetagsize, $oldtag) = getfiletag $file;
+
+sub escapefilename($) {
+  $_ = shift;
+  tr' /:*?|'_';
+  tr/"<>[]/'()()/;
+  s/__+/_/g;
+  return $_;
+}
+
+sub extractgeobdata($) {
+  my $tagbody = shift;
+  my $enc = substr $tagbody, 0, 1;
+  my $mime = fromencstr \$tagbody;
+  substr $tagbody, 0, 0, $enc;
+  my $fname = fromencstr \$tagbody;
+  substr $tagbody, 0, 0, $enc;
+  my $desc = fromencstr \$tagbody;
+  return ($desc, $fname, $mime, $tagbody);
+}
+  
+if ($export) {
+  unless ($oldtag->{GEOB}) {
+    print STDERR 'No GEOB tag exists', "\n";
+    exit 1;
+  }
+  foreach (@{$oldtag->{GEOB}}) {
+    my ($desc, $fname, $mime, $content) = extractgeobdata $_->[0];
+    $mime =~ tr/\//_/;
+    my $basename = $file;
+    $basename =~ s/(.+)\..+$/$1/;
+    if ($datadir) {
+      if ($oldtag->{TALB}) {
+        my $albname = escapefilename fromencstr $oldtag->{TALB}->[0]->[0];
+        $datadir =~ s/%a/$albname/g;
+        mkdir $datadir;
+      }
+      $basename =~ s/^.+\///;
+      $basename = join '/', $datadir, $basename;
+    }
+    my $outfname = join('#', $basename, $desc, $fname, $mime) . '.dat';
+    open FILE, '>', $outfname;
+    binmode FILE;
+    print FILE $content;
+    close FILE;
+    $outfname =~ tr/\0/!/;
+    printf STDERR 'wrote: %s%s', $outfname, "\n";
+  }
+  exit 0;
+}
+if ($show) {
+  printf STDERR "Charcode falled back to %s.\n", FALLBACK_CHRCODE
+    if $codewarn;
+  foreach my $tagname (@order, keys %$oldtag) {
+    if ($oldtag->{$tagname}) {
+      foreach (@{$oldtag->{$tagname}}) {
+        my $tagbody = $_->[0];
+        if ($tagname =~ /^T/) {
+          printf '%s: %s%s', $tagname, fromencstr($tagbody), "\n";
+        }
+        elsif ($tagname eq 'GEOB') {
+          my ($desc, $fname, $mime, $content) = extractgeobdata $tagbody;
+          printf "GEOB: %s[%s]: %s, %d bytes\n",
+            $desc, $fname, $mime, length $content;
+        }
+        else {
+          printf '%s: (%d bytes)%s', $tagname, length($tagbody), "\n";
+        }
+      }
+      delete $oldtag->{$tagname};
+    }
+  }
+  exit 0;
+}
+
+foreach (keys %tags) {
+  if ($tags{$_}) {
+    $tags{$_} = [[toencstr($tags{$_}), $hdflag{$_}]];
+  }
+  else {
+    delete $tags{$_};
+  }
+}
+$tags{$_} ||= $oldtag->{$_} foreach keys %$oldtag;
+
+if ($import) {
+  my $basename = $file;
+  $basename =~ s/(.+)\..+$/$1/;
+  if ($datadir) {
+    if ($tags{TALB}) {
+      my $albname = escapefilename fromencstr $tags{TALB}->[0]->[0];
+      $datadir =~ s/%a/$albname/g;
+    }
+    $basename =~ s/^.+\///;
+    $basename = join '/', $datadir, $basename;
+  }
+  my @files = glob $basename . '#*.dat';
+  my @geobtag;
+  foreach (@files) {
+    my ($desc, $fname, $mime) = /#(.*)#(.*)#(.*).dat/;
+    $mime =~ tr/_/\//;
+    open FILE, '<', $_;
+    binmode FILE;
+    my $body = join '', <FILE>;
+    close FILE;
+    push @geobtag, [toencstr(join "\0", $mime, $fname, $desc, undef) . $body, $hdflag{GEOB}];
+    printf STDERR 'imported: %s%s', $_,"\n";
+  }
+  print STDERR "removed: GEOB tag\n" unless @files;
+  $tags{GEOB} = \@geobtag;
+}
+
+my $tagbody;
+foreach my $tagname (@order, keys %tags) {
+  if ($tags{$tagname}) {
+    $tagbody .= totagframe $tagname, @{$_} foreach @{$tags{$tagname}};
+    $tags{$tagname} = undef;
+  }
+}
+
+my $taghead = 'ID3' . chr(3) . chr(0) . chr(0);
+my $tagsize = calctagsize $tagbody, $file, $filetagsize;
+$taghead .= tosyncsafeint $tagsize;
+$tagbody .= chr(0) x ($tagsize - length $tagbody) if $tagsize > length $tagbody;
+
+my $tagdata = $taghead . $tagbody;
+
+if ($filetagsize == length $tagbody) {
+  open FILE, '+<', $file;
+  binmode FILE;
+  seek FILE, 0, 0;
+  print FILE $tagdata;
+  close FILE;
+}
+else {
+  open TO, '>', $file . '.tmp';
+  binmode TO;
+  print TO $tagdata;
+  open FROM, '<', $file;
+  binmode FROM;
+  seek FROM, $filetagsize + 10, 0 if $filetagsize;
+  print TO $_ while <FROM>;
+  close TO;
+  close FROM;
+  rename $file . '.tmp', $file;
+}
