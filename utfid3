@@ -21,27 +21,29 @@ sub help() {
   print <<EOF;
 Usage: $0 [OPTIONS] mp3-file
 options:
-  -h --help    - show this message and exit
-  -c --create  - do not use old tag value
-  -e --encode  - choose non-ascii encoding (utf16le, utf16be, utf8)
-  -a --artist  - set artist
-  -g --genre   - set genre
-  -A --album   - set album title
-  -d --disc    - set disc no  (# or #/# style)
-  -n --track   - set track no (# or #/# style)
-  -t --title   - set track title
-  -l --length  - set length in ms
-  -i --isrc    - set ISRC code
-  -s --show    - show text tags
-  -x --export  - export GEOB files
-  -m --import  - import GEOB file
-  -D --datadir - specify dirctory for GEOB files (%a: album title)
+  -h --help     - show this message and exit
+  -c --create   - do not use old tag value
+  -e --encode   - choose non-ascii encoding (utf16le, utf16be, utf8)
+  -a --artist   - set artist
+  -g --genre    - set genre
+  -A --album    - set album title
+  -d --disc     - set disc no  (# or #/# style)
+  -n --track    - set track no (# or #/# style)
+  -t --title    - set track title
+  -l --length   - set length in ms
+  -i --isrc     - set ISRC code
+  -I --albumart - set album art
+  -s --show     - show text tags
+  -x --export   - export GEOB files
+  -m --import   - import GEOB file
+  -D --datadir  - specify dirctory for GEOB files (%a: album title)
 EOF
   exit 0;
 }
 
 my $create;
 my $encode = 'utf16le';
+my $albart;
 my $show;
 my $export;
 my $import;
@@ -49,19 +51,20 @@ my $datadir;
 
 Getopt::Long::Configure('gnu_getopt'); 
 GetOptions('help|h' => \&help,
-  'create|c!'   => \$create,
-  'encode|e=s'  => \$encode,
-  'artist|a=s'  => \$tags{TPE1},
-  'genre|g=s'   => \$tags{TCON},
-  'album|A=s'   => \$tags{TALB},
-  'disc|d=s'    => \$tags{TPOS},
-  'track|n=s'   => \$tags{TRCK},
-  'title|t=s'   => \$tags{TIT2},
-  'length|l=s'  => \$tags{TLEN},
-  'isrc|i=s'    => \$tags{TSRC},
-  'show|s!'     => \$show,
-  'export|x!'   => \$export,
-  'import|m!'   => \$import,
+  'create|c!'    => \$create,
+  'encode|e=s'   => \$encode,
+  'artist|a=s'   => \$tags{TPE1},
+  'genre|g=s'    => \$tags{TCON},
+  'album|A=s'    => \$tags{TALB},
+  'disc|d=s'     => \$tags{TPOS},
+  'track|n=s'    => \$tags{TRCK},
+  'title|t=s'    => \$tags{TIT2},
+  'length|l=s'   => \$tags{TLEN},
+  'isrc|i=s'     => \$tags{TSRC},
+  'albumart|I=s' => \$albart,
+  'show|s!'      => \$show,
+  'export|x!'    => \$export,
+  'import|m!'    => \$import,
   'datadir|D=s' => \$datadir,
 ) || help;
 
@@ -270,6 +273,18 @@ foreach (keys %tags) {
     delete $tags{$_};
   }
 }
+
+if ($albart) {
+  die "File not found: $albart" unless -r $albart;
+  my $mime = qx(file -b --mime-type $albart);
+  $mime =~ tr/\r\n//d;
+  my $content;
+  open my $file, '<', $albart;
+  binmode $file;
+  read $file, $content, (-s $albart);
+  $tags{APIC} = [[join('', "\0", $mime, "\0", chr(3), "\0", $content), undef]];
+}
+
 $tags{$_} ||= $oldtag->{$_} foreach keys %$oldtag;
 
 if ($import) {
@@ -300,7 +315,7 @@ if ($import) {
 }
 
 my $tagbody;
-foreach my $tagname (@order, keys %tags) {
+foreach my $tagname (@order, sort keys %tags) {
   if ($tags{$tagname}) {
     $tagbody .= totagframe $tagname, @{$_} foreach @{$tags{$tagname}};
     $tags{$tagname} = undef;
